@@ -868,6 +868,97 @@ struct SSLHandshakerThread final : IThreadPoolReceiver {
 	}
 };
 
+// Ciphertext buffer for coalesced TLS writes (FLOW_KNOBS->TLS_WRITE_COALESCE_BYTES > 0). Grows with realloc because
+// it is appended to from an OpenSSL BIO callback, where exceptions must not propagate.
+struct TLSCipherBuffer : NonCopyable {
+	uint8_t* data = nullptr;
+	size_t size = 0;
+	size_t capacity = 0;
+
+	~TLSCipherBuffer() { release(); }
+
+	bool append(const uint8_t* p, size_t n) {
+		if (size + n > capacity) {
+			size_t newCapacity = std::max(size + n, capacity * 2);
+			uint8_t* newData = static_cast<uint8_t*>(realloc(data, newCapacity));
+			if (!newData) {
+				return false;
+			}
+			data = newData;
+			capacity = newCapacity;
+		}
+		memcpy(data + size, p, n);
+		size += n;
+		return true;
+	}
+
+	void release() {
+		free(data);
+		data = nullptr;
+		size = capacity = 0;
+	}
+};
+
+// Network-thread scratch for one coalesced batch; only the unsent tail is copied into a per-connection buffer.
+static TLSCipherBuffer tlsWriteScratch;
+// Target of the sink BIO while a TLSWbioRedirect is alive.
+static TLSCipherBuffer* tlsSinkTarget = nullptr;
+
+// Write-only BIO that appends everything to *tlsSinkTarget and never asks for a retry, so SSL_write either emits
+// whole records or fails; OpenSSL never holds a partially written record for us.
+static int tlsSinkWrite(BIO* bio, const char* in, int len) {
+	BIO_clear_retry_flags(bio);
+	if (len < 0 || !tlsSinkTarget || !tlsSinkTarget->append(reinterpret_cast<const uint8_t*>(in), len)) {
+		return -1;
+	}
+	return len;
+}
+
+static long tlsSinkCtrl(BIO*, int cmd, long, void*) {
+	return cmd == BIO_CTRL_FLUSH ? 1 : 0;
+}
+
+static int tlsSinkCreate(BIO* bio) {
+	BIO_set_init(bio, 1);
+	return 1;
+}
+
+static BIO* tlsSinkBio() {
+	static BIO* bio = [] {
+		BIO_METHOD* method = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "flow_tls_write_sink");
+		ASSERT(method);
+		BIO_meth_set_write(method, tlsSinkWrite);
+		BIO_meth_set_ctrl(method, tlsSinkCtrl);
+		BIO_meth_set_create(method, tlsSinkCreate);
+		BIO* b = BIO_new(method);
+		ASSERT(b);
+		return b;
+	}();
+	return bio;
+}
+
+// While alive, records produced by `ssl` go to `target` instead of asio's BIO pair. The original write BIO (asio's
+// internal end of the pair) is restored on destruction, so handshake, shutdown and asio's own I/O are unaffected.
+class TLSWbioRedirect : NonCopyable {
+	SSL* ssl;
+	BIO* original;
+
+public:
+	TLSWbioRedirect(SSL* ssl, TLSCipherBuffer* target) : ssl(ssl), original(SSL_get_wbio(ssl)) {
+		ASSERT(!tlsSinkTarget);
+		tlsSinkTarget = target;
+		BIO* sink = tlsSinkBio();
+		// SSL_set0_wbio takes ownership of one reference and frees one reference of the BIO it replaces.
+		BIO_up_ref(original);
+		BIO_up_ref(sink);
+		SSL_set0_wbio(ssl, sink);
+	}
+	~TLSWbioRedirect() {
+		SSL_set0_wbio(ssl, original);
+		tlsSinkTarget = nullptr;
+	}
+};
+
 class SSLConnection final : public IConnection, ReferenceCounted<SSLConnection> {
 public:
 	void addref() override { ReferenceCounted<SSLConnection>::addref(); }
@@ -1206,7 +1297,15 @@ public:
 		boost::system::error_code err;
 		++g_net2->countReads;
 		size_t toRead = end - begin;
-		size_t size = ssl_sock.read_some(boost::asio::mutable_buffers_1(begin, toRead), err);
+		size_t size;
+		if (pendingCipherOffset < pendingCipher.size) {
+			// SSL_read can emit records (alerts, KeyUpdate responses). asio would write them to the socket directly,
+			// interleaving them with our unsent ciphertext, so queue them behind it instead.
+			TLSWbioRedirect redirect(ssl_sock.native_handle(), &pendingCipher);
+			size = ssl_sock.read_some(boost::asio::mutable_buffers_1(begin, toRead), err);
+		} else {
+			size = ssl_sock.read_some(boost::asio::mutable_buffers_1(begin, toRead), err);
+		}
 		g_net2->bytesReceived += size;
 		//TraceEvent("ConnRead", this->id).detail("Bytes", size);
 		if (err) {
@@ -1230,6 +1329,9 @@ public:
 		// broken pipe error.
 		limit = std::min(limit, 2016);
 #endif
+		if (FLOW_KNOBS->TLS_WRITE_COALESCE_BYTES > 0) {
+			return writeCoalesced(data, limit);
+		}
 		boost::system::error_code err;
 		++g_net2->countWrites;
 
@@ -1277,6 +1379,14 @@ private:
 	ssl_socket ssl_sock;
 	NetworkAddress peer_address;
 	Reference<ReferencedObject<boost::asio::ssl::context>> sslContext;
+	// Coalesced writes: ciphertext the socket has not accepted yet, and the plaintext it encodes. That plaintext is
+	// reported to the caller only once all of this ciphertext is sent, so the caller keeps calling write() (with the
+	// same unsent chain) until it is flushed.
+	TLSCipherBuffer pendingCipher;
+	size_t pendingCipherOffset = 0;
+	int pendingPlainBytes = 0;
+	SendBuffer const* pendingHead = nullptr;
+	int pendingHeadSent = 0;
 	bool has_trusted_peer;
 	std::string sni_hostname; // For Server Name Indication
 
@@ -1313,6 +1423,108 @@ private:
 		    .detail("ErrorCode", error.value())
 		    .detail("Message", error.message());
 		closeSocket();
+	}
+
+	// One non-blocking send. Returns bytes accepted by the kernel; 0 if it would block.
+	size_t sendCiphertext(const uint8_t* p, size_t n) {
+		boost::system::error_code err;
+		size_t sent = socket.write_some(boost::asio::const_buffer(p, n), err);
+		if (err) {
+			if (err == boost::asio::error::would_block) {
+				++g_net2->countWouldBlock;
+				return 0;
+			}
+			onWriteError(err);
+			throw connection_failed();
+		}
+		return sent;
+	}
+
+	// Encrypts up to min(limit, TLS_WRITE_COALESCE_BYTES) plaintext bytes from the chain as back-to-back TLS records
+	// and sends them with one socket write, instead of asio's one record (and one send) per write_some. Returns the
+	// plaintext bytes the caller may consider sent; 0 means wait for onWritable() and call again with the same chain.
+	int writeCoalesced(SendBuffer const* data, int limit) {
+		++g_net2->countWrites;
+
+		if (pendingCipherOffset < pendingCipher.size) {
+			// The previous batch is already encrypted (OpenSSL's sequence numbers moved), so its plaintext must not be
+			// encrypted again: finish sending the ciphertext, then report the batch.
+			if (data != pendingHead || data->bytes_sent != pendingHeadSent) {
+				TraceEvent(SevError, "N2_TLSCoalescedWriteChainChanged", id)
+				    .detail("PeerAddr", peer_address)
+				    .detail("PendingPlainBytes", pendingPlainBytes);
+				closeSocket();
+				throw connection_failed();
+			}
+			pendingCipherOffset +=
+			    sendCiphertext(pendingCipher.data + pendingCipherOffset, pendingCipher.size - pendingCipherOffset);
+			if (pendingCipherOffset < pendingCipher.size) {
+				return 0;
+			}
+			int reported = pendingPlainBytes;
+			pendingCipher.release();
+			pendingCipherOffset = 0;
+			pendingPlainBytes = 0;
+			pendingHead = nullptr;
+			return reported;
+		}
+
+		const int budget = std::min(limit, FLOW_KNOBS->TLS_WRITE_COALESCE_BYTES);
+		TLSCipherBuffer& scratch = tlsWriteScratch;
+		scratch.size = 0;
+		int consumed = 0;
+		int sslError = SSL_ERROR_NONE;
+		{
+			SSL* ssl = ssl_sock.native_handle();
+			TLSWbioRedirect redirect(ssl, &scratch);
+			ERR_clear_error();
+			for (SendBuffer const* p = data; p && consumed < budget && sslError == SSL_ERROR_NONE; p = p->next) {
+				const uint8_t* ptr = p->data() + p->bytes_sent;
+				int n = std::min(p->bytes_unsent(), budget - consumed);
+				while (n > 0) {
+					// asio sets SSL_MODE_ENABLE_PARTIAL_WRITE, so each call emits one record of <= 16 KB.
+					int r = SSL_write(ssl, ptr, n);
+					if (r <= 0) {
+						sslError = SSL_get_error(ssl, r);
+						break;
+					}
+					ptr += r;
+					n -= r;
+					consumed += r;
+				}
+			}
+		}
+		if (sslError != SSL_ERROR_NONE) {
+			// The sink never asks for a retry, so this is a fatal error or the peer started a renegotiation, which
+			// this path does not support.
+			TraceEvent(SevWarn, "N2_TLSCoalescedWriteError", id)
+			    .suppressFor(1.0)
+			    .detail("PeerAddr", peer_address)
+			    .detail("SSLError", sslError)
+			    .detail("OpenSSLError", static_cast<uint64_t>(ERR_peek_last_error()))
+			    .detail("Consumed", consumed);
+			closeSocket();
+			throw connection_failed();
+		}
+		if (scratch.size == 0) {
+			return 0;
+		}
+
+		size_t sent = sendCiphertext(scratch.data, scratch.size);
+		if (sent == scratch.size) {
+			return consumed;
+		}
+		static SimpleCounter<int64_t>* countPendingTails =
+		    SimpleCounter<int64_t>::makeCounter("/Net2/TLS/CoalescedWritePendingTails");
+		countPendingTails->increment(1);
+		if (!pendingCipher.append(scratch.data + sent, scratch.size - sent)) {
+			platform::outOfMemory();
+		}
+		pendingCipherOffset = 0;
+		pendingPlainBytes = consumed;
+		pendingHead = data;
+		pendingHeadSent = data->bytes_sent;
+		return 0;
 	}
 };
 

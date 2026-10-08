@@ -225,6 +225,7 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( MAX_PACKET_SEND_BYTES,                        128 * 1024 );
 	init( MIN_PACKET_BUFFER_BYTES,                        4 * 1024 );
 	init( MIN_PACKET_BUFFER_FREE_BYTES,                        256 );
+	init( TLS_WRITE_COALESCE_BYTES,                              0 ); // >0: TLS writes encrypt up to this many bytes (capped by the write limit) into back-to-back records sent with one socket write; 0 uses asio's one record per write.
 	init( FLOW_TCP_NODELAY,                                      1 );
 	init( FLOW_TCP_QUICKACK,                                     0 );
 	init( RESOLVE_PREFER_IPV4_ADDR,                          false );  // Default to prefer IPv6 addresses. Set to true to prefer IPv4 addresses.
