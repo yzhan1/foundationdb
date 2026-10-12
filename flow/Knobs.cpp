@@ -226,6 +226,9 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( MIN_PACKET_BUFFER_BYTES,                        4 * 1024 );
 	init( MIN_PACKET_BUFFER_FREE_BYTES,                        256 );
 	init( TLS_WRITE_COALESCE_BYTES,                              0 ); // >0: TLS writes encrypt up to this many bytes (capped by the write limit) into back-to-back records sent with one socket write; 0 uses asio's one record per write.
+	init( TLS_KTLS_TX,                                       false ); // TLS 1.3 AES-GCM connections hand record encryption for sends to the kernel (TCP_ULP "tls", TLS_TX) after the handshake; others stay in userspace.
+	init( TLS_KTLS_RX,                                       false ); // With TLS_KTLS_TX, also hand receive-side decryption to the kernel (TLS_RX).
+	init( TLS_CIPHERSUITES,                                     "" ); // If non-empty, passed to SSL_CTX_set_ciphersuites (TLS 1.3 suites, e.g. "TLS_AES_128_GCM_SHA256"); empty keeps OpenSSL's default.
 	init( FLOW_TCP_NODELAY,                                      1 );
 	init( FLOW_TCP_QUICKACK,                                     0 );
 	init( RESOLVE_PREFER_IPV4_ADDR,                          false );  // Default to prefer IPv6 addresses. Set to true to prefer IPv4 addresses.

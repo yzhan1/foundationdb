@@ -72,6 +72,18 @@
 #ifdef WIN32
 #include <mmsystem.h>
 #endif
+#include <openssl/kdf.h>
+#if defined(__linux__) && __has_include(<linux/tls.h>)
+#include <linux/tls.h>
+#include <netinet/tcp.h>
+#define FLOW_HAVE_KTLS 1
+#ifndef SOL_TLS
+#define SOL_TLS 282
+#endif
+#ifndef TCP_ULP
+#define TCP_ULP 31
+#endif
+#endif
 #include "flow/actorcompiler.h" // This must be the last #include.
 
 // Defined to track the stack limit
@@ -959,6 +971,132 @@ public:
 	}
 };
 
+// kTLS (FLOW_KNOBS->TLS_KTLS_TX): TLS 1.3 application traffic secrets captured by the keylog callback during the
+// handshake, from which the kernel's record key and IV are derived.
+struct TLSTrafficSecrets {
+	uint8_t client[EVP_MAX_MD_SIZE];
+	uint8_t server[EVP_MAX_MD_SIZE];
+	size_t clientLen;
+	size_t serverLen;
+};
+
+static void freeTLSTrafficSecrets(void*, void* ptr, CRYPTO_EX_DATA*, int, long, void*) {
+	OPENSSL_clear_free(ptr, sizeof(TLSTrafficSecrets));
+}
+
+static int tlsTrafficSecretsIndex() {
+	static int index = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, freeTLSTrafficSecrets);
+	return index;
+}
+
+static int hexNibble(char c) {
+	if (c >= '0' && c <= '9') {
+		return c - '0';
+	}
+	if (c >= 'a' && c <= 'f') {
+		return c - 'a' + 10;
+	}
+	if (c >= 'A' && c <= 'F') {
+		return c - 'A' + 10;
+	}
+	return -1;
+}
+
+// Runs on whichever thread performs the handshake; only touches this SSL's ex_data.
+static void tlsKeylogCallback(const SSL* ssl, const char* line) {
+	// Format: "<LABEL> <client_random hex> <secret hex>"
+	std::string_view entry(line);
+	bool isClient = entry.starts_with("CLIENT_TRAFFIC_SECRET_0 ");
+	if (!isClient && !entry.starts_with("SERVER_TRAFFIC_SECRET_0 ")) {
+		return;
+	}
+	std::string_view hex = entry.substr(entry.rfind(' ') + 1);
+	if (hex.empty() || hex.size() % 2 || hex.size() / 2 > EVP_MAX_MD_SIZE) {
+		return;
+	}
+	auto* secrets = static_cast<TLSTrafficSecrets*>(SSL_get_ex_data(ssl, tlsTrafficSecretsIndex()));
+	if (!secrets) {
+		secrets = static_cast<TLSTrafficSecrets*>(OPENSSL_zalloc(sizeof(TLSTrafficSecrets)));
+		if (!secrets || !SSL_set_ex_data(const_cast<SSL*>(ssl), tlsTrafficSecretsIndex(), secrets)) {
+			OPENSSL_free(secrets);
+			return;
+		}
+	}
+	uint8_t* out = isClient ? secrets->client : secrets->server;
+	for (size_t i = 0; i < hex.size() / 2; i++) {
+		int hi = hexNibble(hex[2 * i]), lo = hexNibble(hex[2 * i + 1]);
+		if (hi < 0 || lo < 0) {
+			return;
+		}
+		out[i] = static_cast<uint8_t>(hi << 4 | lo);
+	}
+	(isClient ? secrets->clientLen : secrets->serverLen) = hex.size() / 2;
+}
+
+// Called for every SSL context Net2 creates.
+static void configureKTLSContext(boost::asio::ssl::context& context) {
+	if (!FLOW_KNOBS->TLS_KTLS_TX) {
+		return;
+	}
+	tlsTrafficSecretsIndex();
+	// TLS 1.3 NewSessionTicket records consume the server's application write sequence numbers before the switch to
+	// the kernel; FDB never resumes sessions, so send none and start the kernel at sequence 0.
+	SSL_CTX_set_num_tickets(context.native_handle(), 0);
+	SSL_CTX_set_keylog_callback(context.native_handle(), tlsKeylogCallback);
+}
+
+// TLS 1.3 HKDF-Expand-Label(secret, label, "", outLen) (RFC 8446 section 7.1).
+static bool tls13ExpandLabel(const EVP_MD* md,
+                             const uint8_t* secret,
+                             size_t secretLen,
+                             std::string_view label,
+                             uint8_t* out,
+                             size_t outLen) {
+	uint8_t info[2 + 1 + 255 + 1];
+	size_t n = 0;
+	info[n++] = static_cast<uint8_t>(outLen >> 8);
+	info[n++] = static_cast<uint8_t>(outLen);
+	info[n++] = static_cast<uint8_t>(6 + label.size());
+	memcpy(info + n, "tls13 ", 6);
+	n += 6;
+	memcpy(info + n, label.data(), label.size());
+	n += label.size();
+	info[n++] = 0; // empty context
+	EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
+	bool ok =
+	    pctx && EVP_PKEY_derive_init(pctx) > 0 && EVP_PKEY_CTX_hkdf_mode(pctx, EVP_PKEY_HKDEF_MODE_EXPAND_ONLY) > 0 &&
+	    EVP_PKEY_CTX_set_hkdf_md(pctx, md) > 0 &&
+	    EVP_PKEY_CTX_set1_hkdf_key(pctx, secret, static_cast<int>(secretLen)) > 0 &&
+	    EVP_PKEY_CTX_add1_hkdf_info(pctx, info, static_cast<int>(n)) > 0 && EVP_PKEY_derive(pctx, out, &outLen) > 0;
+	EVP_PKEY_CTX_free(pctx);
+	return ok;
+}
+
+// Write BIO installed once the kernel owns the send direction: OpenSSL must not emit records any more (its sequence
+// numbers are stale and asio would write them as plaintext into the kTLS socket), so every write fails, which makes
+// the SSL_read that triggered it fail and the connection close.
+static int64_t ktlsBlockedOpenSSLWrites = 0;
+
+static int ktlsGuardWrite(BIO* bio, const char*, int) {
+	BIO_clear_retry_flags(bio);
+	++ktlsBlockedOpenSSLWrites;
+	return -1;
+}
+
+static BIO* ktlsGuardBio() {
+	static BIO* bio = [] {
+		BIO_METHOD* method = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "flow_ktls_tx_guard");
+		ASSERT(method);
+		BIO_meth_set_write(method, ktlsGuardWrite);
+		BIO_meth_set_ctrl(method, tlsSinkCtrl);
+		BIO_meth_set_create(method, tlsSinkCreate);
+		BIO* b = BIO_new(method);
+		ASSERT(b);
+		return b;
+	}();
+	return bio;
+}
+
 class SSLConnection final : public IConnection, ReferenceCounted<SSLConnection> {
 public:
 	void addref() override { ReferenceCounted<SSLConnection>::addref(); }
@@ -1106,6 +1244,7 @@ public:
 				self->ssl_sock.async_handshake(boost::asio::ssl::stream_base::server, std::move(p));
 			}
 			wait(onHandshook);
+			self->maybeEnableKTLS();
 			wait(delay(0, TaskPriority::Handshake));
 			connected.send(Void());
 		} catch (...) {
@@ -1224,6 +1363,7 @@ public:
 				self->ssl_sock.async_handshake(boost::asio::ssl::stream_base::client, std::move(p));
 			}
 			wait(onHandshook);
+			self->maybeEnableKTLS();
 			wait(delay(0, TaskPriority::Handshake));
 			connected.send(Void());
 		} catch (...) {
@@ -1294,6 +1434,11 @@ public:
 	// Reads as many bytes as possible from the read buffer into [begin,end) and returns the number of bytes read (might
 	// be 0)
 	int read(uint8_t* begin, uint8_t* end) override {
+#ifdef FLOW_HAVE_KTLS
+		if (ktlsRx) {
+			return readKernelTLS(begin, end);
+		}
+#endif
 		boost::system::error_code err;
 		++g_net2->countReads;
 		size_t toRead = end - begin;
@@ -1329,6 +1474,9 @@ public:
 		// broken pipe error.
 		limit = std::min(limit, 2016);
 #endif
+		if (ktlsTx) {
+			return writeKernelTLS(data, limit);
+		}
 		if (FLOW_KNOBS->TLS_WRITE_COALESCE_BYTES > 0) {
 			return writeCoalesced(data, limit);
 		}
@@ -1387,6 +1535,9 @@ private:
 	int pendingPlainBytes = 0;
 	SendBuffer const* pendingHead = nullptr;
 	int pendingHeadSent = 0;
+	// The kernel (kTLS) encrypts this connection's sends / decrypts its receives instead of OpenSSL.
+	bool ktlsTx = false;
+	bool ktlsRx = false;
 	bool has_trusted_peer;
 	std::string sni_hostname; // For Server Name Indication
 
@@ -1412,7 +1563,10 @@ private:
 		    .detail("PeerAddr", peer_address)
 		    .detail("PeerAddress", peer_address)
 		    .detail("ErrorCode", error.value())
-		    .detail("Message", error.message());
+		    .detail("Message", error.message())
+		    .detail("KTLSTx", ktlsTx)
+		    .detail("KTLSRx", ktlsRx)
+		    .detail("KTLSBlockedOpenSSLWrites", ktlsBlockedOpenSSLWrites);
 		closeSocket();
 	}
 	void onWriteError(const boost::system::error_code& error) {
@@ -1423,6 +1577,221 @@ private:
 		    .detail("ErrorCode", error.value())
 		    .detail("Message", error.message());
 		closeSocket();
+	}
+
+#ifdef FLOW_HAVE_KTLS
+	// Derives the record key and IV from a TLS 1.3 application traffic secret and hands them to the kernel for
+	// `direction` (TLS_TX or TLS_RX), starting at record sequence 0. Returns 0, an errno, or -1 if derivation failed.
+	int installKernelKey(int direction, bool aes256, const uint8_t* secret, size_t secretLen) {
+		const EVP_MD* md = aes256 ? EVP_sha384() : EVP_sha256();
+		uint8_t key[32];
+		uint8_t iv[12];
+		int rc = -1;
+		if (tls13ExpandLabel(md, secret, secretLen, "key", key, aes256 ? 32 : 16) &&
+		    tls13ExpandLabel(md, secret, secretLen, "iv", iv, sizeof(iv))) {
+			// TLS 1.3 nonce = iv XOR sequence; the kernel takes the iv as salt (first 4 bytes) + iv (last 8 bytes).
+			auto install = [&](auto& info, uint16_t cipherType) {
+				info.info.version = TLS_1_3_VERSION;
+				info.info.cipher_type = cipherType;
+				memcpy(info.key, key, sizeof(info.key));
+				memcpy(info.salt, iv, sizeof(info.salt));
+				memcpy(info.iv, iv + sizeof(info.salt), sizeof(info.iv));
+				int result = setsockopt(socket.native_handle(), SOL_TLS, direction, &info, sizeof(info)) == 0
+				                 ? 0
+				                 : (errno ? errno : EINVAL);
+				OPENSSL_cleanse(&info, sizeof(info));
+				return result;
+			};
+			if (aes256) {
+				tls12_crypto_info_aes_gcm_256 info{};
+				rc = install(info, TLS_CIPHER_AES_GCM_256);
+			} else {
+				tls12_crypto_info_aes_gcm_128 info{};
+				rc = install(info, TLS_CIPHER_AES_GCM_128);
+			}
+		}
+		OPENSSL_cleanse(key, sizeof(key));
+		OPENSSL_cleanse(iv, sizeof(iv));
+		return rc;
+	}
+
+	// TLS_KTLS_RX: called right after TX was handed to the kernel.
+	void maybeEnableKTLSRx(SSL* ssl, bool aes256, const uint8_t* peerSecret, size_t peerSecretLen) {
+		const char* failure = nullptr;
+		int sysError = 0;
+		if (!peerSecretLen) {
+			failure = "NoTrafficSecret";
+		} else if (BIO_ctrl_pending(SSL_get_rbio(ssl)) != 0 || SSL_has_pending(ssl)) {
+			// Bytes asio/OpenSSL already pulled off the socket (e.g. application data that arrived together with the
+			// peer's Finished) would never reach the kernel. If none were, nothing has been received under the peer's
+			// application key yet (FDB sends no data before its handshake completes, and a server sends its tickets
+			// only after the client's Finished), so the kernel starts at sequence 0.
+			failure = "BufferedInput";
+		} else if ((sysError = installKernelKey(TLS_RX, aes256, peerSecret, peerSecretLen)) != 0) {
+			failure = sysError < 0 ? "KeyDerivation" : "TLS_RX";
+		}
+		if (failure) {
+			static SimpleCounter<int64_t>* countFallback =
+			    SimpleCounter<int64_t>::makeCounter("/Net2/TLS/KTLSRxFallback");
+			countFallback->increment(1);
+			TraceEvent(SevWarnAlways, "N2_KTLSRxNotEnabled", id)
+			    .suppressFor(60.0)
+			    .detail("PeerAddr", peer_address)
+			    .detail("Reason", failure)
+			    .detail("Errno", sysError);
+			return;
+		}
+		static SimpleCounter<int64_t>* countEnabled = SimpleCounter<int64_t>::makeCounter("/Net2/TLS/KTLSRxEnabled");
+		countEnabled->increment(1);
+		ktlsRx = true;
+	}
+#endif
+
+	// Called on the network thread once the handshake has completed and before the first application write. On
+	// success the kernel encrypts and frames everything written to the socket; reads stay in OpenSSL unless
+	// TLS_KTLS_RX also moves them to the kernel.
+	void maybeEnableKTLS() {
+		if (!FLOW_KNOBS->TLS_KTLS_TX) {
+			return;
+		}
+		SSL* ssl = ssl_sock.native_handle();
+		auto* secrets = static_cast<TLSTrafficSecrets*>(SSL_get_ex_data(ssl, tlsTrafficSecretsIndex()));
+		const SSL_CIPHER* cipher = SSL_get_current_cipher(ssl);
+		const uint32_t cipherId = cipher ? SSL_CIPHER_get_id(cipher) : 0;
+		[[maybe_unused]] const bool aes256 = cipherId == TLS1_3_CK_AES_256_GCM_SHA384;
+		[[maybe_unused]] const bool server = SSL_is_server(ssl);
+		const char* failure = nullptr;
+		int sysError = 0;
+#ifdef FLOW_HAVE_KTLS
+		if (SSL_version(ssl) != TLS1_3_VERSION) {
+			failure = "NotTLS13";
+		} else if (!aes256 && cipherId != TLS1_3_CK_AES_128_GCM_SHA256) {
+			failure = "UnsupportedCipher";
+		} else if (!secrets || !(server ? secrets->serverLen : secrets->clientLen)) {
+			failure = "NoTrafficSecret";
+		} else if (BIO_wpending(SSL_get_wbio(ssl)) != 0 || SSL_want_write(ssl)) {
+			// Handshake bytes asio has not written yet would land after kernel-framed records.
+			failure = "PendingHandshakeOutput";
+		} else if (setsockopt(socket.native_handle(), SOL_TCP, TCP_ULP, "tls", sizeof("tls")) != 0) {
+			failure = "TCP_ULP";
+			sysError = errno;
+		} else if ((sysError = installKernelKey(TLS_TX,
+		                                        aes256,
+		                                        server ? secrets->server : secrets->client,
+		                                        server ? secrets->serverLen : secrets->clientLen)) != 0) {
+			// With only the ULP attached the socket still passes userspace records through unchanged.
+			failure = sysError < 0 ? "KeyDerivation" : "TLS_TX";
+		} else {
+			// Both sides start application data at write sequence 0: no tickets (configureKTLSContext) and no data
+			// has been sent yet.
+			ktlsTx = true;
+			if (FLOW_KNOBS->TLS_KTLS_RX) {
+				maybeEnableKTLSRx(ssl,
+				                  aes256,
+				                  server ? secrets->client : secrets->server,
+				                  server ? secrets->clientLen : secrets->serverLen);
+			}
+		}
+#else
+		failure = "NotSupportedByBuild";
+#endif
+		if (secrets) {
+			SSL_set_ex_data(ssl, tlsTrafficSecretsIndex(), nullptr);
+			freeTLSTrafficSecrets(nullptr, secrets, nullptr, 0, 0, nullptr);
+		}
+		if (failure) {
+			static SimpleCounter<int64_t>* countFallback =
+			    SimpleCounter<int64_t>::makeCounter("/Net2/TLS/KTLSTxFallback");
+			countFallback->increment(1);
+			TraceEvent(SevWarnAlways, "N2_KTLSTxNotEnabled", id)
+			    .suppressFor(60.0)
+			    .detail("PeerAddr", peer_address)
+			    .detail("Reason", failure)
+			    .detail("Errno", sysError)
+			    .detail("TLSVersion", SSL_get_version(ssl))
+			    .detail("Cipher", cipher ? SSL_CIPHER_get_name(cipher) : "none");
+			return;
+		}
+		static SimpleCounter<int64_t>* countEnabled = SimpleCounter<int64_t>::makeCounter("/Net2/TLS/KTLSTxEnabled");
+		countEnabled->increment(1);
+		BIO* guard = ktlsGuardBio();
+		BIO_up_ref(guard);
+		SSL_set0_wbio(ssl, guard);
+	}
+
+#ifdef FLOW_HAVE_KTLS
+	// Reads once the kernel decrypts (TLS_KTLS_RX). recvmsg with a control buffer returns non-application records
+	// one at a time, tagged with their content type, instead of failing with EIO.
+	int readKernelTLS(uint8_t* begin, uint8_t* end) {
+		++g_net2->countReads;
+		loop {
+			alignas(cmsghdr) char control[CMSG_SPACE(sizeof(unsigned char))];
+			iovec iov{ begin, static_cast<size_t>(end - begin) };
+			msghdr msg{};
+			msg.msg_iov = &iov;
+			msg.msg_iovlen = 1;
+			msg.msg_control = control;
+			msg.msg_controllen = sizeof(control);
+			ssize_t n = ::recvmsg(socket.native_handle(), &msg, 0);
+			if (n < 0) {
+				if (errno == EINTR) {
+					continue;
+				}
+				if (errno == EAGAIN || errno == EWOULDBLOCK) {
+					++g_net2->countWouldBlock;
+					return 0;
+				}
+				onReadError(boost::system::error_code(errno, boost::system::system_category()));
+				throw connection_failed();
+			}
+			if (n == 0) {
+				onReadError(boost::asio::error::eof);
+				throw connection_failed();
+			}
+			unsigned char recordType = 23; // application_data
+			cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+			if (cmsg && cmsg->cmsg_level == SOL_TLS && cmsg->cmsg_type == TLS_GET_RECORD_TYPE) {
+				recordType = *CMSG_DATA(cmsg);
+			}
+			if (recordType == 23) {
+				g_net2->bytesReceived += n;
+				return n;
+			}
+			// A NewSessionTicket (handshake message type 4) from a server that still sends tickets is not needed: FDB
+			// never resumes sessions. Anything else (KeyUpdate, alerts) cannot be handled once OpenSSL is bypassed.
+			if (recordType == 22 && begin[0] == 4) {
+				static SimpleCounter<int64_t>* countSkippedTickets =
+				    SimpleCounter<int64_t>::makeCounter("/Net2/TLS/KTLSRxSkippedTickets");
+				countSkippedTickets->increment(1);
+				continue;
+			}
+			TraceEvent(SevWarnAlways, "N2_KTLSRxUnexpectedRecord", id)
+			    .suppressFor(1.0)
+			    .detail("PeerAddr", peer_address)
+			    .detail("RecordType", recordType)
+			    .detail("FirstByte", begin[0]);
+			closeSocket();
+			throw connection_failed();
+		}
+	}
+#endif
+
+	// Plaintext Connection::write semantics: the kernel encrypts and frames records.
+	int writeKernelTLS(SendBuffer const* data, int limit) {
+		boost::system::error_code err;
+		++g_net2->countWrites;
+		size_t sent = socket.write_some(
+		    boost::iterator_range<SendBufferIterator>(SendBufferIterator(data, limit), SendBufferIterator()), err);
+		if (err) {
+			if (err == boost::asio::error::would_block) {
+				++g_net2->countWouldBlock;
+				return 0;
+			}
+			onWriteError(err);
+			throw connection_failed();
+		}
+		ASSERT(sent);
+		return sent;
 	}
 
 	// One non-blocking send. Returns bytes accepted by the kernel; 0 if it would block.
@@ -1648,6 +2017,7 @@ ACTOR static Future<Void> reloadCertificatesOnChange(
 			LoadedTLSConfig loaded = wait(config.loadAsync());
 			boost::asio::ssl::context context(boost::asio::ssl::context::tls);
 			ConfigureSSLContext(loaded, context);
+			configureKTLSContext(context);
 			*policy = makeReference<TLSPolicy>(loaded, onPolicyFailure);
 			TraceEvent(SevInfo, "TLSCertificateRefreshSucceeded").log();
 			mismatches = 0;
@@ -1682,6 +2052,7 @@ void Net2::initTLS(ETLSInitState targetState) {
 			    .detail("VerifyPeers", boost::algorithm::join(loaded.getVerifyPeers(), "|"));
 			auto loadedTlsConfig = tlsConfig.loadSync();
 			ConfigureSSLContext(loadedTlsConfig, newContext);
+			configureKTLSContext(newContext);
 			activeTlsPolicy = makeReference<TLSPolicy>(loadedTlsConfig, onPolicyFailure);
 			sslContextVar.set(ReferencedObject<boost::asio::ssl::context>::from(std::move(newContext)));
 		} catch (Error& e) {
@@ -2616,6 +2987,23 @@ TEST_CASE("flow/Net2/ThreadSafeQueue/Threaded") {
 		waitThread(perThread[t].handle);
 		perThread[t].checkDone();
 	}
+	return Void();
+}
+
+TEST_CASE("flow/Net2/TLS13ExpandLabel") {
+	// RFC 8448 section 3, {server} derive write traffic keys for application data.
+	const uint8_t secret[32] = { 0xa1, 0x1a, 0xf9, 0xf0, 0x55, 0x31, 0xf8, 0x56, 0xad, 0x47, 0x11,
+		                         0x6b, 0x45, 0xa9, 0x50, 0x32, 0x82, 0x04, 0xb4, 0xf4, 0x4b, 0xfb,
+		                         0x6b, 0x3a, 0x4b, 0x4f, 0x1f, 0x3f, 0xcb, 0x63, 0x16, 0x43 };
+	const uint8_t expectedKey[16] = { 0x9f, 0x02, 0x28, 0x3b, 0x6c, 0x9c, 0x07, 0xef,
+		                              0xc2, 0x6b, 0xb9, 0xf2, 0xac, 0x92, 0xe3, 0x56 };
+	const uint8_t expectedIv[12] = { 0xcf, 0x78, 0x2b, 0x88, 0xdd, 0x83, 0x54, 0x9a, 0xad, 0xf1, 0xe9, 0x84 };
+	uint8_t key[16];
+	uint8_t iv[12];
+	ASSERT(N2::tls13ExpandLabel(EVP_sha256(), secret, sizeof(secret), "key", key, sizeof(key)));
+	ASSERT(N2::tls13ExpandLabel(EVP_sha256(), secret, sizeof(secret), "iv", iv, sizeof(iv)));
+	ASSERT(memcmp(key, expectedKey, sizeof(key)) == 0);
+	ASSERT(memcmp(iv, expectedIv, sizeof(iv)) == 0);
 	return Void();
 }
 

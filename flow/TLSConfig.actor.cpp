@@ -115,6 +115,12 @@ void ConfigureSSLContext(const LoadedTLSConfig& loaded, boost::asio::ssl::contex
 			verifyFailIfNoPeerCert = 0;
 		context.set_verify_mode(boost::asio::ssl::context::verify_peer | verifyFailIfNoPeerCert);
 
+		if (!FLOW_KNOBS->TLS_CIPHERSUITES.empty() &&
+		    !SSL_CTX_set_ciphersuites(context.native_handle(), FLOW_KNOBS->TLS_CIPHERSUITES.c_str())) {
+			TraceEvent(SevWarnAlways, "TLSCipherSuitesInvalid").detail("CipherSuites", FLOW_KNOBS->TLS_CIPHERSUITES);
+			throw tls_error();
+		}
+
 		context.set_password_callback([password = loaded.getPassword()](
 		                                  size_t, boost::asio::ssl::context::password_purpose) { return password; });
 
