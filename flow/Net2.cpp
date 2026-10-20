@@ -74,6 +74,7 @@
 #include <mmsystem.h>
 #endif
 #include "flow/CoroUtils.h"
+#include "NetIO.h"
 
 // Defined to track the stack limit
 extern "C" intptr_t g_stackYieldLimit;
@@ -227,6 +228,8 @@ public:
 
 	const TLSConfig& getTLSConfig() const override { return tlsConfig; }
 
+	double getNetIOThreadsCPUSeconds() const override { return netIOThreads.cpuSeconds(); }
+
 	bool checkRunnable() override;
 
 #ifdef ENABLE_SAMPLING
@@ -346,6 +349,13 @@ public:
 	std::vector<std::string> blobCredentialFiles;
 	Optional<std::string> proxy;
 	std::vector<std::function<void()>> stopCallbacks;
+
+	NetIOThreads netIOThreads;
+
+private:
+	Future<Reference<IConnection>> connectImpl(NetworkAddress toAddr,
+	                                           tcp::socket* existingSocket,
+	                                           NetIODirection netioDirection);
 };
 
 static boost::asio::ip::address tcpAddress(IPAddress const& n) {
@@ -431,21 +441,98 @@ public:
 	}
 };
 
-class Connection final : public IConnection, ReferenceCounted<Connection> {
+template <class Stream>
+class StreamConnection : public IConnection {
+public:
+	void close() override {
+		if (netio) {
+			netio->close();
+		} else {
+			closeSocket();
+		}
+	}
+
+	// returns when write() can write at least one byte
+	Future<Void> onWritable() override {
+		++g_net2->countWriteProbes;
+		if (netio) {
+			return netio->onWritable();
+		}
+		BindPromise p("N2_WriteProbeError", id, peer_address);
+		auto f = p.getFuture();
+		socket.async_write_some(boost::asio::null_buffers(), std::move(p));
+		return f;
+	}
+
+	// returns when read() can read at least one byte
+	Future<Void> onReadable() override {
+		++g_net2->countReadProbes;
+		if (netio) {
+			return netio->onReadable();
+		}
+		BindPromise p("N2_ReadProbeError", id, peer_address);
+		auto f = p.getFuture();
+		socket.async_read_some(boost::asio::null_buffers(), std::move(p));
+		return f;
+	}
+
+	NetworkAddress getPeerAddress() const override { return peer_address; }
+
+	UID getDebugID() const override { return id; }
+
+	tcp::socket& getSocket() override {
+		ASSERT(!netio);
+		return socket;
+	}
+
+protected:
+	template <class... Args>
+	explicit StreamConnection(Args&&... args)
+	  : id(nondeterministicRandom()->randomUniqueID()), stream(std::forward<Args>(args)...),
+	    socket(tcpSocketOf(stream)) {}
+
+	UID id;
+	Stream stream;
+	tcp::socket& socket;
+	NetworkAddress peer_address;
+	NetIODirection netioDirection = NetIODirection::None;
+	std::unique_ptr<NetIOConnection> netio; // once set, a net I/O thread owns the socket: use only netio
+
+	virtual void closeSocket() = 0;
+
+	virtual std::unique_ptr<INetIOTransport> makeTransport(tcp::socket&& moved) = 0;
+
+	void startNetIO() {
+		NetIOThread* thread = g_net2->netIOThreads.pick(netioDirection);
+		if (thread == nullptr || netio) {
+			return;
+		}
+		if (std::optional<tcp::socket> moved = moveSocketToNetIOThread(socket, *thread)) {
+			netio = std::make_unique<NetIOConnection>(
+			    *thread, makeTransport(std::move(*moved)), netioDirection, id, peer_address);
+		}
+	}
+
+private:
+	static tcp::socket& tcpSocketOf(tcp::socket& s) { return s; }
+	static tcp::socket& tcpSocketOf(boost::asio::ssl::stream<tcp::socket>& s) { return s.next_layer(); }
+};
+
+class Connection final : public StreamConnection<tcp::socket>, ReferenceCounted<Connection> {
 public:
 	void addref() override { ReferenceCounted<Connection>::addref(); }
 	void delref() override { ReferenceCounted<Connection>::delref(); }
 
-	void close() override { closeSocket(); }
-
-	explicit Connection(boost::asio::io_context& io_service)
-	  : id(nondeterministicRandom()->randomUniqueID()), socket(io_service) {}
+	explicit Connection(boost::asio::io_context& io_service) : StreamConnection(io_service) {}
 
 	// This is not part of the IConnection interface, because it is wrapped by INetwork::connect()
-	static Future<Reference<IConnection>> connect(boost::asio::io_context* ios, NetworkAddress addr) {
+	static Future<Reference<IConnection>> connect(boost::asio::io_context* ios,
+	                                              NetworkAddress addr,
+	                                              NetIODirection netioDirection) {
 		Reference<Connection> self(new Connection(*ios));
 
 		self->peer_address = addr;
+		self->netioDirection = netioDirection;
 		try {
 			auto to = tcpEndpoint(addr);
 			BindPromise p("N2_ConnectError", self->id, self->peer_address);
@@ -465,29 +552,18 @@ public:
 	// This is not part of the IConnection interface, because it is wrapped by IListener::accept()
 	void accept(NetworkAddress peerAddr) {
 		this->peer_address = peerAddr;
+		this->netioDirection = NetIODirection::Incoming;
 		init();
 	}
 
-	Future<Void> acceptHandshake() override { return Void(); }
-
-	Future<Void> connectHandshake() override { return Void(); }
-
-	// returns when write() can write at least one byte
-	Future<Void> onWritable() override {
-		++g_net2->countWriteProbes;
-		BindPromise p("N2_WriteProbeError", id, peer_address);
-		auto f = p.getFuture();
-		socket.async_write_some(boost::asio::null_buffers(), std::move(p));
-		return f;
+	Future<Void> acceptHandshake() override {
+		startNetIO();
+		return Void();
 	}
 
-	// returns when read() can read at least one byte
-	Future<Void> onReadable() override {
-		++g_net2->countReadProbes;
-		BindPromise p("N2_ReadProbeError", id, peer_address);
-		auto f = p.getFuture();
-		socket.async_read_some(boost::asio::null_buffers(), std::move(p));
-		return f;
+	Future<Void> connectHandshake() override {
+		startNetIO();
+		return Void();
 	}
 
 	// Reads as many bytes as possible from the read buffer into [begin,end) and returns the number of bytes read (might
@@ -496,7 +572,8 @@ public:
 		boost::system::error_code err;
 		++g_net2->countReads;
 		size_t toRead = end - begin;
-		size_t size = socket.read_some(boost::asio::mutable_buffer(begin, toRead), err);
+		size_t size =
+		    netio ? netio->read(begin, end, err) : socket.read_some(boost::asio::mutable_buffer(begin, toRead), err);
 		g_net2->bytesReceived += size;
 		//TraceEvent("ConnRead", this->id).detail("Bytes", size);
 		if (err) {
@@ -518,8 +595,10 @@ public:
 		boost::system::error_code err;
 		++g_net2->countWrites;
 
-		size_t sent = socket.write_some(
-		    boost::iterator_range<SendBufferIterator>(SendBufferIterator(data, limit), SendBufferIterator()), err);
+		size_t sent = netio ? netio->write(data, limit, err)
+		                    : socket.write_some(boost::iterator_range<SendBufferIterator>(
+		                                            SendBufferIterator(data, limit), SendBufferIterator()),
+		                                        err);
 
 		if (err) {
 			// Since there was an error, sent's value can't be used to infer that the buffer has data and the limit is
@@ -547,19 +626,9 @@ public:
 		return sent;
 	}
 
-	NetworkAddress getPeerAddress() const override { return peer_address; }
-
 	bool hasTrustedPeer() const override { return true; }
 
-	UID getDebugID() const override { return id; }
-
-	tcp::socket& getSocket() override { return socket; }
-
 private:
-	UID id;
-	tcp::socket socket;
-	NetworkAddress peer_address;
-
 	void init() {
 		// Socket settings that have to be set after connect or accept succeeds
 		socket.non_blocking(true);
@@ -576,7 +645,7 @@ private:
 		platform::setCloseOnExec(socket.native_handle());
 	}
 
-	void closeSocket() {
+	void closeSocket() override {
 		boost::system::error_code error;
 		if (socket.close(error)) {
 			TraceEvent(SevWarn, "N2_CloseError", id)
@@ -588,6 +657,10 @@ private:
 		}
 	}
 
+	std::unique_ptr<INetIOTransport> makeTransport(tcp::socket&& moved) override {
+		return makeTcpNetIOTransport(std::move(moved));
+	}
+
 	void onReadError(const boost::system::error_code& error) {
 		TraceEvent(SevWarn, "N2_ReadError", id)
 		    .suppressFor(1.0)
@@ -595,7 +668,7 @@ private:
 		    .detail("PeerAddress", peer_address)
 		    .detail("ErrorCode", error.value())
 		    .detail("Message", error.message());
-		closeSocket();
+		close();
 	}
 	void onWriteError(const boost::system::error_code& error) {
 		TraceEvent(SevWarn, "N2_WriteError", id)
@@ -604,7 +677,7 @@ private:
 		    .detail("PeerAddress", peer_address)
 		    .detail("ErrorCode", error.value())
 		    .detail("Message", error.message());
-		closeSocket();
+		close();
 	}
 };
 
@@ -830,7 +903,7 @@ public:
 	NetworkAddress getListenAddress() const override { return listenAddress; }
 };
 
-using ssl_socket = boost::asio::ssl::stream<boost::asio::ip::tcp::socket&>;
+using ssl_socket = boost::asio::ssl::stream<boost::asio::ip::tcp::socket>;
 
 struct SSLHandshakerThread final : IThreadPoolReceiver {
 	SSLHandshakerThread() = default;
@@ -890,26 +963,23 @@ struct SSLHandshakerThread final : IThreadPoolReceiver {
 	}
 };
 
-class SSLConnection final : public IConnection, ReferenceCounted<SSLConnection> {
+class SSLConnection final : public StreamConnection<ssl_socket>, ReferenceCounted<SSLConnection> {
 public:
 	void addref() override { ReferenceCounted<SSLConnection>::addref(); }
 	void delref() override { ReferenceCounted<SSLConnection>::delref(); }
 
-	void close() override { closeSocket(); }
-
 	explicit SSLConnection(boost::asio::io_context& io_service,
 	                       Reference<ReferencedObject<boost::asio::ssl::context>> context)
-	  : id(nondeterministicRandom()->randomUniqueID()), socket(io_service), ssl_sock(socket, context->mutate()),
-	    sslContext(context), has_trusted_peer(false) {}
+	  : StreamConnection(io_service, context->mutate()), sslContext(context), has_trusted_peer(false) {}
 
 	explicit SSLConnection(Reference<ReferencedObject<boost::asio::ssl::context>> context, tcp::socket* existingSocket)
-	  : id(nondeterministicRandom()->randomUniqueID()), socket(std::move(*existingSocket)),
-	    ssl_sock(socket, context->mutate()), sslContext(context) {}
+	  : StreamConnection(std::move(*existingSocket), context->mutate()), sslContext(context) {}
 
 	// This is not part of the IConnection interface, because it is wrapped by INetwork::connect()
 	static Future<Reference<IConnection>> connect(boost::asio::io_context* ios,
 	                                              Reference<ReferencedObject<boost::asio::ssl::context>> context,
 	                                              NetworkAddress addr,
+	                                              NetIODirection netioDirection,
 	                                              tcp::socket* existingSocket = nullptr,
 	                                              std::string hostname = {}) {
 		std::pair<IPAddress, uint16_t> peerIP = std::make_pair(addr.ip, addr.port);
@@ -939,6 +1009,7 @@ public:
 		Reference<SSLConnection> self(new SSLConnection(*ios, context));
 		self->peer_address = addr;
 		self->sni_hostname = std::move(hostname);
+		self->netioDirection = netioDirection;
 		try {
 			auto to = tcpEndpoint(self->peer_address);
 			BindPromise p("N2_ConnectError", self->id, self->peer_address);
@@ -958,6 +1029,7 @@ public:
 	// This is not part of the IConnection interface, because it is wrapped by IListener::accept()
 	void accept(NetworkAddress peerAddr) {
 		this->peer_address = peerAddr;
+		this->netioDirection = NetIODirection::Incoming;
 		init();
 	}
 
@@ -967,7 +1039,7 @@ public:
 		try {
 			Future<Void> onHandshook;
 			ConfigureSSLStream(N2::g_net2->activeTlsPolicy,
-			                   self->ssl_sock,
+			                   self->stream,
 			                   self->peer_address,
 			                   [conn = self.getPtr()](bool verifyOk) { conn->has_trusted_peer = verifyOk; });
 
@@ -980,7 +1052,7 @@ public:
 				countServerTLSHandshakesOnSideThreads->increment(1);
 				holder = Hold(&N2::g_net2->sslPoolHandshakesInProgress);
 				auto handshake =
-				    new SSLHandshakerThread::Handshake(self->ssl_sock, boost::asio::ssl::stream_base::server);
+				    new SSLHandshakerThread::Handshake(self->stream, boost::asio::ssl::stream_base::server);
 				handshake->setPeerAddr(self->getPeerAddress());
 				onHandshook = handshake->done.getFuture();
 				N2::g_net2->sslHandshakerPool->post(handshake);
@@ -991,10 +1063,12 @@ public:
 				countServerTLSHandshakesOnMainThread->increment(1);
 				BindPromise p("N2_AcceptHandshakeError"_audit, self->id, self->getPeerAddress());
 				onHandshook = p.getFuture();
-				self->ssl_sock.async_handshake(boost::asio::ssl::stream_base::server, std::move(p));
+				self->stream.async_handshake(boost::asio::ssl::stream_base::server, std::move(p));
 			}
 			co_await onHandshook;
 			co_await delay(0, TaskPriority::Handshake);
+			// Must directly precede connected.send(): until then the handshake wrapper may close the socket.
+			self->startNetIO();
 			connected.send(Void());
 		} catch (...) {
 			self->closeSocket();
@@ -1069,16 +1143,16 @@ public:
 		try {
 			Future<Void> onHandshook;
 			ConfigureSSLStream(N2::g_net2->activeTlsPolicy,
-			                   self->ssl_sock,
+			                   self->stream,
 			                   self->peer_address,
 			                   [conn = self.getPtr()](bool verifyOk) { conn->has_trusted_peer = verifyOk; });
 
 			// Set SNI hostname if we have one (for connections made with hostname) and SSL flags to check
 			// certificate against.
 			if (!self->sni_hostname.empty()) {
-				int result = SSL_set_tlsext_host_name(self->ssl_sock.native_handle(), self->sni_hostname.c_str());
-				SSL_set1_host(self->ssl_sock.native_handle(), self->sni_hostname.c_str());
-				SSL_set_hostflags(self->ssl_sock.native_handle(), X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+				int result = SSL_set_tlsext_host_name(self->stream.native_handle(), self->sni_hostname.c_str());
+				SSL_set1_host(self->stream.native_handle(), self->sni_hostname.c_str());
+				SSL_set_hostflags(self->stream.native_handle(), X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
 				TraceEvent("SSLSetSNIResult")
 				    .detail("Hostname", self->sni_hostname)
 				    .detail("Result", result)
@@ -1101,7 +1175,7 @@ public:
 				countClientTLSHandshakesOnSideThreads->increment(1);
 				holder = Hold(&N2::g_net2->sslPoolHandshakesInProgress);
 				auto handshake =
-				    new SSLHandshakerThread::Handshake(self->ssl_sock, boost::asio::ssl::stream_base::client);
+				    new SSLHandshakerThread::Handshake(self->stream, boost::asio::ssl::stream_base::client);
 				handshake->setPeerAddr(self->getPeerAddress());
 				onHandshook = handshake->done.getFuture();
 				N2::g_net2->sslHandshakerPool->post(handshake);
@@ -1112,10 +1186,12 @@ public:
 				countClientTLSHandshakesOnMainThread->increment(1);
 				BindPromise p("N2_ConnectHandshakeError"_audit, self->id, self->getPeerAddress());
 				onHandshook = p.getFuture();
-				self->ssl_sock.async_handshake(boost::asio::ssl::stream_base::client, std::move(p));
+				self->stream.async_handshake(boost::asio::ssl::stream_base::client, std::move(p));
 			}
 			co_await onHandshook;
 			co_await delay(0, TaskPriority::Handshake);
+			// Must directly precede connected.send(): until then the handshake wrapper may close the socket.
+			self->startNetIO();
 			connected.send(Void());
 		} catch (...) {
 			self->closeSocket();
@@ -1164,31 +1240,14 @@ public:
 
 	Future<Void> connectHandshake() override { return connectHandshakeWrapper(Reference<SSLConnection>::addRef(this)); }
 
-	// returns when write() can write at least one byte
-	Future<Void> onWritable() override {
-		++g_net2->countWriteProbes;
-		BindPromise p("N2_WriteProbeError", id, peer_address);
-		auto f = p.getFuture();
-		socket.async_write_some(boost::asio::null_buffers(), std::move(p));
-		return f;
-	}
-
-	// returns when read() can read at least one byte
-	Future<Void> onReadable() override {
-		++g_net2->countReadProbes;
-		BindPromise p("N2_ReadProbeError", id, peer_address);
-		auto f = p.getFuture();
-		socket.async_read_some(boost::asio::null_buffers(), std::move(p));
-		return f;
-	}
-
 	// Reads as many bytes as possible from the read buffer into [begin,end) and returns the number of bytes read (might
 	// be 0)
 	int read(uint8_t* begin, uint8_t* end) override {
 		boost::system::error_code err;
 		++g_net2->countReads;
 		size_t toRead = end - begin;
-		size_t size = ssl_sock.read_some(boost::asio::mutable_buffer(begin, toRead), err);
+		size_t size =
+		    netio ? netio->read(begin, end, err) : stream.read_some(boost::asio::mutable_buffer(begin, toRead), err);
 		g_net2->bytesReceived += size;
 		//TraceEvent("ConnRead", this->id).detail("Bytes", size);
 		if (err) {
@@ -1208,15 +1267,17 @@ public:
 	// bytes written (might be 0)
 	int write(SendBuffer const* data, int limit) override {
 #ifdef __APPLE__
-		// For some reason, writing ssl_sock with more than 2016 bytes when socket is writeable sometimes results in a
+		// For some reason, writing stream with more than 2016 bytes when socket is writeable sometimes results in a
 		// broken pipe error.
 		limit = std::min(limit, 2016);
 #endif
 		boost::system::error_code err;
 		++g_net2->countWrites;
 
-		size_t sent = ssl_sock.write_some(
-		    boost::iterator_range<SendBufferIterator>(SendBufferIterator(data, limit), SendBufferIterator()), err);
+		size_t sent = netio ? netio->write(data, limit, err)
+		                    : stream.write_some(boost::iterator_range<SendBufferIterator>(
+		                                            SendBufferIterator(data, limit), SendBufferIterator()),
+		                                        err);
 
 		if (err) {
 			// Since there was an error, sent's value can't be used to infer that the buffer has data and the limit is
@@ -1244,21 +1305,11 @@ public:
 		return sent;
 	}
 
-	NetworkAddress getPeerAddress() const override { return peer_address; }
-
 	bool hasTrustedPeer() const override { return has_trusted_peer; }
 
-	UID getDebugID() const override { return id; }
-
-	tcp::socket& getSocket() override { return socket; }
-
-	ssl_socket& getSSLSocket() { return ssl_sock; }
+	ssl_socket& getSSLSocket() { return stream; }
 
 private:
-	UID id;
-	tcp::socket socket;
-	ssl_socket ssl_sock;
-	NetworkAddress peer_address;
 	Reference<ReferencedObject<boost::asio::ssl::context>> sslContext;
 	bool has_trusted_peer;
 	std::string sni_hostname; // For Server Name Indication
@@ -1270,7 +1321,7 @@ private:
 		platform::setCloseOnExec(socket.native_handle());
 	}
 
-	void closeSocket() {
+	void closeSocket() override {
 		boost::system::error_code cancelError;
 		// NOLINTNEXTLINE(bugprone-unused-return-value): Closing the socket below also cancels outstanding operations.
 		socket.cancel(cancelError);
@@ -1279,7 +1330,13 @@ private:
 		socket.close(closeError);
 		boost::system::error_code shutdownError;
 		// NOLINTNEXTLINE(bugprone-unused-return-value): Best-effort TLS teardown after the transport has closed.
-		ssl_sock.shutdown(shutdownError);
+		stream.shutdown(shutdownError);
+	}
+
+	std::unique_ptr<INetIOTransport> makeTransport(tcp::socket&& moved) override {
+		// The verify callback points at this connection; replace it so the I/O thread never runs or destroys it.
+		stream.set_verify_callback([](bool, boost::asio::ssl::verify_context&) { return false; });
+		return makeTlsNetIOTransport(std::move(stream), std::move(moved));
 	}
 
 	void onReadError(const boost::system::error_code& error) {
@@ -1289,7 +1346,7 @@ private:
 		    .detail("PeerAddress", peer_address)
 		    .detail("ErrorCode", error.value())
 		    .detail("Message", error.message());
-		closeSocket();
+		close();
 	}
 	void onWriteError(const boost::system::error_code& error) {
 		TraceEvent(SevWarn, "N2_WriteError", id)
@@ -1298,7 +1355,7 @@ private:
 		    .detail("PeerAddress", peer_address)
 		    .detail("ErrorCode", error.value())
 		    .detail("Message", error.message());
-		closeSocket();
+		close();
 	}
 };
 
@@ -1365,8 +1422,8 @@ Net2::Net2(const TLSConfig& tlsConfig, bool useThreadPool, bool useMetrics)
         boost::asio::ssl::context(boost::asio::ssl::context::tls)) }),
     sslHandshakerThreadsStarted(0), sslPoolHandshakesInProgress(0), tlsConfig(tlsConfig),
     tlsInitializedState(ETLSInitState::NONE), network(this), tscBegin(0), tscEnd(0), taskBegin(0),
-    currentTaskID(TaskPriority::DefaultYield), stopped(false), started(false), numYields(0),
-    lastPriorityStats(nullptr) {
+    currentTaskID(TaskPriority::DefaultYield), stopped(false), started(false), numYields(0), lastPriorityStats(nullptr),
+    netIOThreads(reactor.ios) {
 	// Until run() is called, yield() will always yield
 	TraceEvent("Net2Starting").log();
 
@@ -1760,6 +1817,7 @@ void Net2::run() {
 	for (auto& fn : stopCallbacks) {
 		fn();
 	}
+	netIOThreads.stop();
 
 	// Emit at least one batch of counters, for manual inspection.
 	simpleCounterReport();
@@ -1945,9 +2003,17 @@ THREAD_HANDLE Net2::startThread(THREAD_FUNC_RETURN (*func)(void*), void* arg, in
 }
 
 Future<Reference<IConnection>> Net2::connect(NetworkAddress toAddr, tcp::socket* existingSocket) {
+	return connectImpl(
+	    toAddr, existingSocket, existingSocket == nullptr ? NetIODirection::Outgoing : NetIODirection::None);
+}
+
+Future<Reference<IConnection>> Net2::connectImpl(NetworkAddress toAddr,
+                                                 tcp::socket* existingSocket,
+                                                 NetIODirection netioDirection) {
 	if (toAddr.isTLS()) {
 		initTLS(ETLSInitState::CONNECT);
-		return SSLConnection::connect(&this->reactor.ios, this->sslContextVar.get(), toAddr, existingSocket);
+		return SSLConnection::connect(
+		    &this->reactor.ios, this->sslContextVar.get(), toAddr, netioDirection, existingSocket);
 	}
 
 	if (tlsConfig.getDisablePlainTextConnection()) {
@@ -1955,19 +2021,20 @@ Future<Reference<IConnection>> Net2::connect(NetworkAddress toAddr, tcp::socket*
 		throw connection_failed();
 	}
 
-	return Connection::connect(&this->reactor.ios, toAddr);
+	return Connection::connect(&this->reactor.ios, toAddr, netioDirection);
 }
 
 Future<Reference<IConnection>> Net2::connectExternal(NetworkAddress toAddr) {
-	return connect(toAddr);
+	return connectImpl(toAddr, nullptr, NetIODirection::None);
 }
 
 Future<Reference<IConnection>> Net2::connectExternalWithHostname(NetworkAddress toAddr, const std::string& hostname) {
 	if (toAddr.isTLS()) {
 		initTLS(ETLSInitState::CONNECT);
-		return SSLConnection::connect(&this->reactor.ios, this->sslContextVar.get(), toAddr, nullptr, hostname);
+		return SSLConnection::connect(
+		    &this->reactor.ios, this->sslContextVar.get(), toAddr, NetIODirection::None, nullptr, hostname);
 	}
-	return connect(toAddr);
+	return connectImpl(toAddr, nullptr, NetIODirection::None);
 }
 
 Future<Reference<IUDPSocket>> Net2::createUDPSocket(NetworkAddress toAddr) {
@@ -2263,6 +2330,10 @@ void ASIOReactor::react() {
 
 void ASIOReactor::wake() {
 	boost::asio::post(ios, nullCompletionHandler);
+}
+
+NetIOThreads& getNetIOThreads() {
+	return g_net2->netIOThreads;
 }
 
 } // namespace N2

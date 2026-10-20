@@ -254,6 +254,9 @@ public:
 	// Return the TLS Configuration
 	virtual const TLSConfig& getTLSConfig() const = 0;
 
+	// Network thread. CPU time used so far by the net I/O threads (FLOW_KNOBS->NET_IO_OFFLOAD_THREADS); 0 if none.
+	virtual double getNetIOThreadsCPUSeconds() const { return 0; }
+
 	// Gets the number of free and total bytes available on the disk which contains directory
 	virtual void getDiskBytes(std::string const& directory, int64_t& free, int64_t& total) = 0;
 

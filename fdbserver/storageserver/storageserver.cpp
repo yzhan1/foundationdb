@@ -854,6 +854,29 @@ private:
 	int ongoingTasks = 0;
 };
 
+// The CPU usage reported to data distribution: process CPU without the net I/O threads', in percent of this storage
+// server's own sampling window (other storage servers of the process sample at other times).
+class CPUUsageWindow {
+public:
+	Optional<double> sample(double time, double processCPUSeconds, double netIOCPUSeconds) {
+		Optional<double> usage;
+		if (lastTime != 0 && time > lastTime) {
+			const double cpuSeconds =
+			    (processCPUSeconds - lastProcessCPUSeconds) - (netIOCPUSeconds - lastNetIOCPUSeconds);
+			usage = std::max(0.0, 100 * cpuSeconds / (time - lastTime));
+		}
+		lastTime = time;
+		lastProcessCPUSeconds = processCPUSeconds;
+		lastNetIOCPUSeconds = netIOCPUSeconds;
+		return usage;
+	}
+
+private:
+	double lastTime = 0;
+	double lastProcessCPUSeconds = 0;
+	double lastNetIOCPUSeconds = 0;
+};
+
 struct StorageServer : public IStorageMetricsService {
 	using VersionedData = VersionedMap<KeyRef, ValueOrClearToRef>;
 
@@ -1014,6 +1037,7 @@ public:
 	    freeable; // for each version, an Arena that must be held until that version is < oldestVersion
 	Arena lastArena;
 	double cpuUsage;
+	CPUUsageWindow cpuUsageWindow;
 	double diskUsage;
 
 	std::map<Version, Standalone<VerUpdateRef>> const& getMutationLog() const { return mutationLog; }
@@ -2019,11 +2043,52 @@ void updateProcessStats(StorageServer* self) {
 		return;
 	}
 
+	const double time = timer();
+	const double processCPUSeconds = getProcessorTimeProcess();
+	const double netIOCPUSeconds = g_network->getNetIOThreadsCPUSeconds();
+	const Optional<double> cpuUsage = self->cpuUsageWindow.sample(time, processCPUSeconds, netIOCPUSeconds);
+	if (cpuUsage.present()) {
+		self->cpuUsage = cpuUsage.get();
+	}
+
 	SystemStatistics sysStats = getSystemStatistics();
 	if (sysStats.initialized) {
-		self->cpuUsage = 100 * sysStats.processCPUSeconds / sysStats.elapsed;
 		self->diskUsage = 100 * std::max(0.0, (sysStats.elapsed - sysStats.processDiskIdleSeconds) / sysStats.elapsed);
 	}
+}
+
+TEST_CASE("/fdbserver/storageserver/CPUUsageWindow") {
+	CPUUsageWindow window;
+	ASSERT(!window.sample(1000.0, 50.0, 0).present());
+	for (int i = 0; i < 100; ++i) {
+		const double time = 1000.0 + (i + 1) * deterministicRandom()->random01() * 5;
+		const double processCPU = 50.0 + (i + 1) * deterministicRandom()->random01() * 3;
+		CPUUsageWindow a;
+		a.sample(1000.0, 50.0, 0);
+		const double elapsed = time - 1000.0;
+		const double processCPUSeconds = processCPU - 50.0;
+		if (elapsed <= 0) {
+			continue;
+		}
+		ASSERT(a.sample(time, processCPU, 0).get() == 100 * processCPUSeconds / elapsed);
+	}
+
+	CPUUsageWindow first;
+	CPUUsageWindow second;
+	auto processCPU = [](double t) { return 10 + 1.5 * (t - 100); };
+	auto netIOCPU = [](double t) { return 2 + 0.3 * (t - 100); };
+	first.sample(100, processCPU(100), netIOCPU(100));
+	second.sample(100.4, processCPU(100.4), netIOCPU(100.4));
+	for (double t = 101; t < 110; t += 1) {
+		ASSERT(std::abs(first.sample(t, processCPU(t), netIOCPU(t)).get() - 120) < 1e-6);
+		ASSERT(std::abs(second.sample(t + 0.4, processCPU(t + 0.4), netIOCPU(t + 0.4)).get() - 120) < 1e-6);
+	}
+
+	CPUUsageWindow skewed;
+	skewed.sample(200, 20, 5);
+	ASSERT_EQ(skewed.sample(201, 20.5, 5.6).get(), 0.0);
+	ASSERT(!skewed.sample(200.5, 21, 5.7).present());
+	return Void();
 }
 
 ///////////////////////////////////// Queries /////////////////////////////////

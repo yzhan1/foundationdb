@@ -224,7 +224,7 @@ void ConfigureSSLContext(const LoadedTLSConfig& loaded, boost::asio::ssl::contex
 // e.g. for peer with a valid, trusted length-3 certificate chain (root CA, intermediate CA, and server certs),
 // callback(true) will be called 3 times.
 void ConfigureSSLStream(Reference<TLSPolicy> policy,
-                        boost::asio::ssl::stream<boost::asio::ip::tcp::socket&>& stream,
+                        boost::asio::ssl::stream<boost::asio::ip::tcp::socket>& stream,
                         const NetworkAddress& peerAddress,
                         std::function<void(bool)> callback);
 
