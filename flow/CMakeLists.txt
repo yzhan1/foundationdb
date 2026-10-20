@@ -172,6 +172,17 @@ else()
 endif()
 target_link_libraries(mkcert PUBLIC flow)
 
+if(FDB_REGISTER_UNIT_TESTS AND Python3_EXECUTABLE)
+  add_dependencies(unit_tests mkcert)
+  add_test(NAME unit/flow_test/netio_tls
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/netio_tls_test.py
+      --mkcert $<TARGET_FILE:mkcert> --flow-test $<TARGET_FILE:flow_test> --seed ${UNIT_TEST_SEED})
+  set_tests_properties(unit/flow_test/netio_tls PROPERTIES
+    LABELS "unit;netio_tls;flow_test"
+    TIMEOUT ${UNIT_TEST_TIMEOUT}
+    ENVIRONMENT "${SANITIZER_OPTIONS}")
+endif()
+
 if(NOT FOUNDATIONDB_CROSS_COMPILING) # FIXME(swift): make this work when
                                      # x-compiling.
   add_subdirectory(bench EXCLUDE_FROM_ALL)

@@ -155,7 +155,7 @@ void ConfigureSSLContext(const LoadedTLSConfig& loaded, boost::asio::ssl::contex
 }
 
 void ConfigureSSLStream(Reference<TLSPolicy> policy,
-                        boost::asio::ssl::stream<boost::asio::ip::tcp::socket&>& stream,
+                        boost::asio::ssl::stream<boost::asio::ip::tcp::socket>& stream,
                         const NetworkAddress& peerAddress,
                         std::function<void(bool)> callback) {
 	try {

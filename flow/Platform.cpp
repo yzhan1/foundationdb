@@ -274,6 +274,38 @@ double getProcessorTimeThread() {
 #endif
 }
 
+double getProcessorTimeThread(THREAD_HANDLE thread) {
+#if defined(_WIN32)
+	FILETIME ftCreate, ftExit, ftKernel, ftUser;
+	if (!GetThreadTimes(thread, &ftCreate, &ftExit, &ftKernel, &ftUser)) {
+		TraceEvent(SevError, "GetThreadCPUTime").GetLastError();
+		throw platform_error();
+	}
+	return FiletimeAsInt64(ftKernel) / double(1e7) + FiletimeAsInt64(ftUser) / double(1e7);
+#elif defined(__linux__) || defined(__FreeBSD__)
+	clockid_t clock;
+	timespec ts;
+	if (pthread_getcpuclockid(thread, &clock) != 0 || clock_gettime(clock, &ts) != 0) {
+		TraceEvent(SevError, "GetThreadCPUTime").GetLastError();
+		throw platform_error();
+	}
+	return ts.tv_sec + ts.tv_nsec / double(1e9);
+#elif defined(__APPLE__)
+	struct thread_basic_info info;
+	mach_msg_type_number_t info_count = THREAD_BASIC_INFO_COUNT;
+	if (KERN_SUCCESS !=
+	    thread_info(pthread_mach_thread_np(thread), THREAD_BASIC_INFO, (thread_info_t)&info, &info_count)) {
+		TraceEvent(SevError, "GetThreadCPUTime").GetLastError();
+		throw platform_error();
+	}
+	return (info.user_time.seconds + (info.user_time.microseconds / double(1e6)) + info.system_time.seconds +
+	        (info.system_time.microseconds / double(1e6)));
+#else
+#warning getProcessorTimeThread unimplemented on this platform
+	return 0.0;
+#endif
+}
+
 double getProcessorTimeProcess() {
 	INJECT_FAULT(platform_error, "getProcessorTimeProcess"); // Get CPU Process Time failed
 #if defined(_WIN32)

@@ -286,6 +286,9 @@ SystemStatistics getSystemStatistics(std::string const& dataFolder,
 
 double getProcessorTimeThread();
 
+// `thread` must be a running thread of this process.
+double getProcessorTimeThread(THREAD_HANDLE thread);
+
 double getProcessorTimeProcess();
 
 #ifdef __linux__
