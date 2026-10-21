@@ -40,6 +40,11 @@
 #endif
 #include <boost/asio.hpp>
 #include "boost/asio/ssl.hpp"
+#include <openssl/crypto.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/evp.h>
+#include <openssl/provider.h>
+#endif
 #include <boost/date_time/posix_time/posix_time_types.hpp>
 #include <boost/range.hpp>
 #include <boost/algorithm/string/join.hpp>
@@ -1462,12 +1467,18 @@ void Net2::initTLS(ETLSInitState targetState) {
 		try {
 			boost::asio::ssl::context newContext(boost::asio::ssl::context::tls);
 			const LoadedTLSConfig& loaded = tlsConfig.loadSync();
+			bool fipsEnabled = false;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+			fipsEnabled = EVP_default_properties_is_fips_enabled(nullptr) && OSSL_PROVIDER_available(nullptr, "fips");
+#endif
 			TraceEvent("Net2TLSConfig")
 			    .detail("CAPath", tlsConfig.getCAPathSync())
 			    .detail("CertificatePath", tlsConfig.getCertificatePathSync())
 			    .detail("KeyPath", tlsConfig.getKeyPathSync())
 			    .detail("HasPassword", !loaded.getPassword().empty())
-			    .detail("VerifyPeers", boost::algorithm::join(loaded.getVerifyPeers(), "|"));
+			    .detail("VerifyPeers", boost::algorithm::join(loaded.getVerifyPeers(), "|"))
+			    .detail("OpenSSLVersion", OpenSSL_version(OPENSSL_VERSION))
+			    .detail("FIPSEnabled", fipsEnabled);
 			auto loadedTlsConfig = tlsConfig.loadSync();
 			ConfigureSSLContext(loadedTlsConfig, newContext);
 			activeTlsPolicy = makeReference<TLSPolicy>(loadedTlsConfig, onPolicyFailure);
