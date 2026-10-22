@@ -109,6 +109,13 @@ void LoadedTLSConfig::print(FILE* fp) {
 void ConfigureSSLContext(const LoadedTLSConfig& loaded, boost::asio::ssl::context& context) {
 	try {
 		context.set_options(boost::asio::ssl::context::default_workarounds);
+#ifdef FDB_REQUIRE_FIPS
+		// boost::asio's context::tls lowers the minimum protocol to TLS 1.0 after SSL_CTX_new has applied
+		// openssl.cnf, so apply its system_default section (MinProtocol, Groups) again.
+		if (!SSL_CTX_config(context.native_handle(), "system_default")) {
+			ERR_clear_error();
+		}
+#endif
 		auto verifyFailIfNoPeerCert = boost::asio::ssl::verify_fail_if_no_peer_cert;
 		// Servers get to accept connections without peer certs as "untrusted" clients
 		if (loaded.getEndpointType() == TLSEndpointType::SERVER)

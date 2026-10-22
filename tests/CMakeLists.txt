@@ -551,6 +551,12 @@ if(WITH_PYTHON)
     else()
       set(ld_env_name "LD_LIBRARY_PATH")
     endif()
+    set(authz_ld_path ${CMAKE_BINARY_DIR}/lib)
+    if(NOT OPENSSL_USE_STATIC_LIBS)
+      # Python's hashlib loads the system libcrypto before libfdb_c, which then binds to it by soname.
+      get_filename_component(openssl_lib_dir ${OPENSSL_CRYPTO_LIBRARY} DIRECTORY)
+      set(authz_ld_path ${openssl_lib_dir}:${authz_ld_path})
+    endif()
 
     set(authz_venv_dir ${CMAKE_CURRENT_BINARY_DIR}/authorization_test_venv)
     set(authz_venv_activate ". ${authz_venv_dir}/bin/activate")
@@ -602,7 +608,7 @@ if(WITH_PYTHON)
           NAME ${authz_test_name}
           WORKING_DIRECTORY ${authz_venv_dir}
           COMMAND bash -c ${authz_test_cmd})
-        set_tests_properties(${authz_test_name} PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/tests/TestRunner;${ld_env_name}=${CMAKE_BINARY_DIR}/lib")
+        set_tests_properties(${authz_test_name} PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/tests/TestRunner;${ld_env_name}=${authz_ld_path}")
         set_tests_properties(${authz_test_name} PROPERTIES FIXTURES_REQUIRED authz_virtual_env)
         set_tests_properties(${authz_test_name} PROPERTIES TIMEOUT 120)
       endforeach()

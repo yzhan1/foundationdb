@@ -1465,12 +1465,10 @@ std::string S3BlobStoreEndpoint::hmac_sha1(Credentials const& creds, std::string
 	return SHA1::from_string(kopad);
 }
 
+// EVP_Digest and one-shot HMAC() go through OpenSSL 3 providers, so they use the FIPS module when it is active.
 std::string sha256_hex(std::string str) {
 	unsigned char hash[SHA256_DIGEST_LENGTH];
-	SHA256_CTX sha256;
-	SHA256_Init(&sha256);
-	SHA256_Update(&sha256, str.c_str(), str.size());
-	SHA256_Final(hash, &sha256);
+	ASSERT(EVP_Digest(str.data(), str.size(), hash, nullptr, EVP_sha256(), nullptr) == 1);
 	std::stringstream ss;
 	for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
 		ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
@@ -1480,13 +1478,8 @@ std::string sha256_hex(std::string str) {
 
 std::string hmac_sha256_hex(std::string key, std::string msg) {
 	unsigned char hash[32];
-
-	HMAC_CTX* hmac = HMAC_CTX_new();
-	HMAC_Init_ex(hmac, &key[0], key.length(), EVP_sha256(), NULL);
-	HMAC_Update(hmac, (unsigned char*)&msg[0], msg.length());
 	unsigned int len = 32;
-	HMAC_Final(hmac, hash, &len);
-	HMAC_CTX_free(hmac);
+	ASSERT(HMAC(EVP_sha256(), key.data(), key.length(), (const unsigned char*)msg.data(), msg.length(), hash, &len));
 
 	std::stringstream ss;
 	ss << std::hex << std::setfill('0');
@@ -1498,13 +1491,8 @@ std::string hmac_sha256_hex(std::string key, std::string msg) {
 
 std::string hmac_sha256(std::string key, std::string msg) {
 	unsigned char hash[32];
-
-	HMAC_CTX* hmac = HMAC_CTX_new();
-	HMAC_Init_ex(hmac, &key[0], key.length(), EVP_sha256(), NULL);
-	HMAC_Update(hmac, (unsigned char*)&msg[0], msg.length());
 	unsigned int len = 32;
-	HMAC_Final(hmac, hash, &len);
-	HMAC_CTX_free(hmac);
+	ASSERT(HMAC(EVP_sha256(), key.data(), key.length(), (const unsigned char*)msg.data(), msg.length(), hash, &len));
 
 	std::stringstream ss;
 	ss << std::setfill('0');

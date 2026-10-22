@@ -2064,7 +2064,15 @@ int main(int argc, char* argv[]) {
 			              /* tracePartialFileSuffix = */ "",
 			              InitializeTraceMetrics::True);
 
-			g_network->initTLS();
+			try {
+				g_network->initTLS();
+			} catch (Error& e) {
+				fprintf(stderr,
+				        "ERROR: TLS initialization failed: %s. This build requires OpenSSL in FIPS mode (see the "
+				        "FIPSRequiredButNotEnabled trace event).\n",
+				        e.what());
+				flushAndExit(FDB_EXIT_ERROR);
+			}
 			if (!opts.authzPublicKeyFile.empty()) {
 				try {
 					FlowTransport::transport().loadPublicKeyFile(opts.authzPublicKeyFile);

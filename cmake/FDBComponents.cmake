@@ -27,8 +27,10 @@ endif()
 set(CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR})
 # Statically link OpenSSL to FDB, see
 #    https://cmake.org/cmake/help/v3.24/module/FindOpenSSL.html
-# Without the flags, OpenSSL is dynamically linked.
-set(OPENSSL_USE_STATIC_LIBS TRUE)
+# Without the flags, OpenSSL is dynamically linked. FIPS builds pass -DOPENSSL_USE_STATIC_LIBS=FALSE.
+if(NOT DEFINED OPENSSL_USE_STATIC_LIBS)
+  set(OPENSSL_USE_STATIC_LIBS TRUE)
+endif()
 if (WIN32)
   set(OPENSSL_MSVC_STATIC_RT ON)
 endif()
@@ -36,6 +38,13 @@ endif()
 find_package(ZLIB REQUIRED)
 find_package(OpenSSL REQUIRED)
 add_compile_options(-DHAVE_OPENSSL)
+option(FDB_REQUIRE_FIPS "Fail TLS initialization unless OpenSSL runs in FIPS mode" OFF)
+if(FDB_REQUIRE_FIPS)
+  if(OPENSSL_VERSION VERSION_LESS 3.0)
+    message(FATAL_ERROR "FDB_REQUIRE_FIPS needs OpenSSL 3.0 or later, found ${OPENSSL_VERSION}")
+  endif()
+  add_compile_options(-DFDB_REQUIRE_FIPS)
+endif()
 
 ################################################################################
 # Python Bindings
