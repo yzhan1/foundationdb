@@ -26,10 +26,10 @@ fetch 3.5.9 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
 fetch 3.1.2 a0ce69b8b97ea6a35b96875235aa453b966ba3cba8af2de23657d8b6767d6539
 
 (cd openssl-3.5.9 &&
-	./Configure --prefix="$PREFIX" --openssldir="$PREFIX/ssl" shared CFLAGS="-O3" LDFLAGS="-Wl,-rpath,$PREFIX/lib64" &&
+	./Configure --prefix="$PREFIX" --openssldir="$PREFIX/ssl" --libdir=lib64 shared CFLAGS="-O3" LDFLAGS="-Wl,-rpath,$PREFIX/lib64" &&
 	make -j"$JOBS" && make install_sw install_ssldirs)
 (cd openssl-3.1.2 &&
-	./Configure enable-fips --prefix="$PREFIX" --openssldir="$PREFIX/ssl" &&
+	./Configure enable-fips --prefix="$PREFIX" --openssldir="$PREFIX/ssl" --libdir=lib64 &&
 	make -j"$JOBS" && make install_fips)
 
 # fips.so 3.1.2 also offers X25519/X448, which #4985 does not approve, so TLS groups are limited to NIST curves.
