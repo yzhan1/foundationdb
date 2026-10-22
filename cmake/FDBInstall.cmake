@@ -221,9 +221,11 @@ function(fdb_install)
     set(install_export 0)
     if(IN_TARGETS)
       set(args TARGETS ${IN_TARGETS})
-      # An RPATH that CMake rewrites at install time gets a trailing empty element (the current directory),
-      # so link with the install RPATH, which keeps link directories outside the build tree.
-      set_target_properties(${IN_TARGETS} PROPERTIES BUILD_WITH_INSTALL_RPATH ON INSTALL_RPATH_USE_LINK_PATH ON)
+      if(NOT OPENSSL_USE_STATIC_LIBS)
+        # With shared OpenSSL, the RPATH CMake rewrites at install time gets a trailing empty element (the current
+        # directory), so link with the install RPATH, which keeps link directories outside the build tree.
+        set_target_properties(${IN_TARGETS} PROPERTIES BUILD_WITH_INSTALL_RPATH ON INSTALL_RPATH_USE_LINK_PATH ON)
+      endif()
     elseif(IN_FILES)
       set(args FILES ${IN_FILES})
     elseif(IN_PROGRAMS)
