@@ -1,10 +1,12 @@
 #!/bin/bash
-# Builds static OpenSSL 3.5.9 and the OpenSSL FIPS Provider 3.1.2 (fips.so, FIPS 140-3, CMVP certificate #4985)
-# into PREFIX, then writes PREFIX/ssl/openssl.cnf so binaries linked against these static libraries run in FIPS
-# mode with no environment variables (libcrypto's compiled-in OPENSSLDIR and MODULESDIR point at PREFIX).
+# Builds shared OpenSSL 3.5.9 and the OpenSSL FIPS Provider 3.1.2 (fips.so, FIPS 140-3, CMVP certificate #4985)
+# into PREFIX, then writes PREFIX/ssl/openssl.cnf so binaries linked against these libraries run in FIPS mode with
+# no environment variables (libcrypto's compiled-in OPENSSLDIR and MODULESDIR point at PREFIX).
+# Shared, not static: a process that loads several libfdb_c copies (multi-version client) must share one libcrypto,
+# because a second static libcrypto copy fails to create an SSL context once fips.so is loaded.
 #
 # Usage: packaging/fips/build-openssl.sh [PREFIX]    (default /opt/openssl-fips)
-#        cmake -DOPENSSL_ROOT_DIR=PREFIX ...
+#        cmake -DOPENSSL_ROOT_DIR=PREFIX -DOPENSSL_USE_STATIC_LIBS=FALSE ...
 # Run it in a scratch directory; tarballs already there are used instead of downloading (offline builders).
 # Needs a C toolchain, make and perl with IPC::Cmd, Time::Piece and Digest::SHA
 # (Rocky 9: perl-IPC-Cmd perl-Time-Piece perl-Digest-SHA).
@@ -24,7 +26,7 @@ fetch 3.5.9 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
 fetch 3.1.2 a0ce69b8b97ea6a35b96875235aa453b966ba3cba8af2de23657d8b6767d6539
 
 (cd openssl-3.5.9 &&
-	./Configure --prefix="$PREFIX" --openssldir="$PREFIX/ssl" no-shared CFLAGS="-fPIC -O3" &&
+	./Configure --prefix="$PREFIX" --openssldir="$PREFIX/ssl" shared CFLAGS="-O3" LDFLAGS="-Wl,-rpath,$PREFIX/lib64" &&
 	make -j"$JOBS" && make install_sw install_ssldirs)
 (cd openssl-3.1.2 &&
 	./Configure enable-fips --prefix="$PREFIX" --openssldir="$PREFIX/ssl" &&
