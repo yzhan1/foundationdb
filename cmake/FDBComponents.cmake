@@ -38,6 +38,13 @@ endif()
 find_package(ZLIB REQUIRED)
 find_package(OpenSSL REQUIRED)
 add_compile_options(-DHAVE_OPENSSL)
+option(FDB_REQUIRE_FIPS "Fail TLS initialization unless OpenSSL runs in FIPS mode" OFF)
+if(FDB_REQUIRE_FIPS)
+  if(OPENSSL_VERSION VERSION_LESS 3.0)
+    message(FATAL_ERROR "FDB_REQUIRE_FIPS needs OpenSSL 3.0 or later, found ${OPENSSL_VERSION}")
+  endif()
+  add_compile_options(-DFDB_REQUIRE_FIPS)
+endif()
 
 ################################################################################
 # Python Bindings

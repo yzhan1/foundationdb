@@ -42,7 +42,9 @@
 #include "boost/asio/ssl.hpp"
 #include <openssl/crypto.h>
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/core_names.h>
 #include <openssl/evp.h>
+#include <openssl/params.h>
 #include <openssl/provider.h>
 #endif
 #include <boost/date_time/posix_time/posix_time_types.hpp>
@@ -1456,6 +1458,20 @@ ACTOR static Future<Void> reloadCertificatesOnChange(
 	}
 }
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+static int getFIPSProviderVersion(OSSL_PROVIDER* provider, void* version) {
+	if (std::string_view(OSSL_PROVIDER_get0_name(provider)) != "fips") {
+		return 1;
+	}
+	char* v = nullptr;
+	OSSL_PARAM params[] = { OSSL_PARAM_construct_utf8_ptr(OSSL_PROV_PARAM_VERSION, &v, 0), OSSL_PARAM_construct_end() };
+	if (OSSL_PROVIDER_get_params(provider, params) && v != nullptr) {
+		*static_cast<std::string*>(version) = v;
+	}
+	return 0;
+}
+#endif
+
 void Net2::initTLS(ETLSInitState targetState) {
 	if (tlsInitializedState >= targetState) {
 		return;
@@ -1463,14 +1479,24 @@ void Net2::initTLS(ETLSInitState targetState) {
 	// Any target state must be higher than NONE so if the current state is NONE
 	// then initialize the TLS config
 	if (tlsInitializedState == ETLSInitState::NONE) {
+		bool fipsEnabled = false;
+		std::string fipsProviderVersion;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+		fipsEnabled = EVP_default_properties_is_fips_enabled(nullptr) && OSSL_PROVIDER_available(nullptr, "fips");
+		OSSL_PROVIDER_do_all(nullptr, getFIPSProviderVersion, &fipsProviderVersion);
+#endif
+#ifdef FDB_REQUIRE_FIPS
+		if (!fipsEnabled) {
+			TraceEvent(SevError, "FIPSRequiredButNotEnabled")
+			    .detail("OpenSSLVersion", OpenSSL_version(OPENSSL_VERSION))
+			    .detail("FIPSProviderVersion", fipsProviderVersion);
+			throw tls_error();
+		}
+#endif
 		auto onPolicyFailure = [this]() { this->countTLSPolicyFailures++; };
 		try {
 			boost::asio::ssl::context newContext(boost::asio::ssl::context::tls);
 			const LoadedTLSConfig& loaded = tlsConfig.loadSync();
-			bool fipsEnabled = false;
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
-			fipsEnabled = EVP_default_properties_is_fips_enabled(nullptr) && OSSL_PROVIDER_available(nullptr, "fips");
-#endif
 			TraceEvent("Net2TLSConfig")
 			    .detail("CAPath", tlsConfig.getCAPathSync())
 			    .detail("CertificatePath", tlsConfig.getCertificatePathSync())
@@ -1478,7 +1504,8 @@ void Net2::initTLS(ETLSInitState targetState) {
 			    .detail("HasPassword", !loaded.getPassword().empty())
 			    .detail("VerifyPeers", boost::algorithm::join(loaded.getVerifyPeers(), "|"))
 			    .detail("OpenSSLVersion", OpenSSL_version(OPENSSL_VERSION))
-			    .detail("FIPSEnabled", fipsEnabled);
+			    .detail("FIPSEnabled", fipsEnabled)
+			    .detail("FIPSProviderVersion", fipsProviderVersion);
 			auto loadedTlsConfig = tlsConfig.loadSync();
 			ConfigureSSLContext(loadedTlsConfig, newContext);
 			activeTlsPolicy = makeReference<TLSPolicy>(loadedTlsConfig, onPolicyFailure);

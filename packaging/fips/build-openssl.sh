@@ -6,7 +6,7 @@
 # because a second static libcrypto copy fails to create an SSL context once fips.so is loaded.
 #
 # Usage: packaging/fips/build-openssl.sh [PREFIX]    (default /opt/openssl-fips)
-#        cmake -DOPENSSL_ROOT_DIR=PREFIX -DOPENSSL_USE_STATIC_LIBS=FALSE ...
+#        cmake -DOPENSSL_ROOT_DIR=PREFIX -DOPENSSL_USE_STATIC_LIBS=FALSE -DFDB_REQUIRE_FIPS=ON ...
 # Run it in a scratch directory; tarballs already there are used instead of downloading (offline builders).
 # Needs a C toolchain, make and perl with IPC::Cmd, Time::Piece and Digest::SHA
 # (Rocky 9: perl-IPC-Cmd perl-Time-Piece perl-Digest-SHA).
@@ -33,6 +33,7 @@ fetch 3.1.2 a0ce69b8b97ea6a35b96875235aa453b966ba3cba8af2de23657d8b6767d6539
 	make -j"$JOBS" && make install_fips)
 
 # fips.so 3.1.2 also offers X25519/X448, which #4985 does not approve, so TLS groups are limited to NIST curves.
+# MinProtocol makes the TLS 1.2 floor explicit.
 cat >"$PREFIX/ssl/openssl.cnf" <<EOF
 config_diagnostics = 1
 openssl_conf = openssl_init
@@ -51,6 +52,7 @@ default_properties = fips=yes
 [ssl_sect]
 system_default = system_default_sect
 [system_default_sect]
+MinProtocol = TLSv1.2
 Groups = P-256:P-384:P-521
 EOF
 
